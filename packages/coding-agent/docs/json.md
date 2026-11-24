@@ -105,6 +105,7 @@ The top-level `usage` is the latest cumulative provider-reported usage for the a
 | `tool_execution_start` | `toolCallId`, `toolName`, `args` | Tool execution started. |
 | `tool_execution_update` | `toolCallId`, `toolName`, `args`, `partialResult` | The tool reported a partial result. |
 | `tool_execution_end` | `toolCallId`, `toolName`, `result`, `isError`, `durationMs` | Tool execution finished. `durationMs` is how long the tool's `execute()` took, measured with a monotonic clock; absent when the tool did not run. |
+| `parked` | `toolCallId`, `toolName` | The tool parked its call instead of finishing it: there is no `tool_execution_end` or result, and the run ends without `agent_settled`. See [Park a tool call](cli-integration.md#park-a-tool-call-and-resume-without-a-prompt). |
 
 Use `toolCallId` to correlate the lifecycle. `partialResult` is the latest partial result supplied by the tool. Whether it replaces or extends an earlier update depends on that tool's result contract.
 

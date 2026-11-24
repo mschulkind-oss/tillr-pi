@@ -1072,6 +1072,7 @@ export async function main(args: string[], options?: MainOptions) {
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,
+			resumeWithoutPrompt: Boolean(parsed.session || parsed.continue || parsed.sessionId),
 		});
 		stopThemeWatcher();
 		restoreStdout();

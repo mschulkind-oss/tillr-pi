@@ -43,13 +43,31 @@ This is structured event output, not a single JSON result or a constraint on the
 
 All prompts are supplied when the process starts. The process streams events for that run and then exits; it does not accept later commands.
 
-A failed or aborted assistant response appears in the event stream but does not by itself produce a nonzero exit status. Inspect the events when success or failure matters. Pi still exits nonzero if the invocation throws an error.
+A failed or aborted assistant response appears in the event stream but does not by itself produce a nonzero exit status. Inspect the events when success or failure matters. Pi still exits nonzero if the invocation throws an error, and reports it as a final `{"type":"error","message":"..."}` event on stdout.
 
 Streaming `message_update` records contain deltas rather than a growing message snapshot. Assemble live output from the delta events, then replace it with the authoritative message from `message_end`.
 
 `agent_end` can be followed by automatic recovery or queued work. `agent_settled` marks the end of automatic work for the current run.
 
 Stdout is reserved for JSONL. Diagnostics and application logging are written to stderr. See [JSON Event Stream](json.md) for framing, event shapes, and reconstruction rules.
+
+## Park a tool call and resume without a prompt
+
+A tool can leave its call unanswered by returning `{ content: [], details: {}, park: true }` from `execute()`. Pi saves the assistant's call but no result for it. Other calls in the same batch finish and save their results. The run then ends: Pi makes no further model request and skips `agent_before_settle`.
+
+In print and JSON modes the process then exits 0 after flushing output and disposing the session. JSON mode emits a top-level `{"type":"parked","toolCallId":"...","toolName":"..."}` event for each parked call, followed by `agent_end`. A parked run does not emit `agent_settled`.
+
+Keep session persistence enabled. Once the tool can supply its answer, open the same session without a prompt:
+
+```bash
+pi --mode json --session /path/to/session.jsonl
+```
+
+Pi calls the tool again with the original call ID and arguments, saves its result, and continues to the model without adding a user message. If the tool parks again, the process exits as above. A saved trailing tool result is also continued, without calling the tool again. If there is neither an unanswered call nor a trailing result, the process emits a JSON `error` event (or writes the error to stderr in text mode), exits nonzero, and makes no model request.
+
+A message an extension sends while the session starts is delivered first. If that message starts a turn, its turn runs the unanswered calls and continues the session, and Pi does not continue it a second time.
+
+Opening the session with a prompt also runs the unanswered calls first. If one parks again, the prompt is not sent.
 
 ## Control Pi with RPC
 

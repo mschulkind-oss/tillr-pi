@@ -25,6 +25,11 @@ export interface PrintModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
+	/**
+	 * The launch names a saved session. With no prompt, continue its unanswered tool calls or its
+	 * trailing tool result instead of exiting.
+	 */
+	resumeWithoutPrompt?: boolean;
 }
 
 /**
@@ -35,6 +40,11 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
 	let session = runtimeHost.session;
+	// Read the saved transcript before session_start handlers can append to it.
+	let canResumeFromToolResult =
+		options.resumeWithoutPrompt === true && session.agent.state.messages.at(-1)?.role === "toolResult";
+	// A startup send can continue the session itself; then there is nothing left to resume.
+	let requestedModel = false;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
 	let disposing: Promise<void> | undefined;
@@ -83,6 +93,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "assistant") requestedModel = true;
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
 			}
@@ -134,12 +145,37 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		await rebindSession();
 
-		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
+		if (options.resumeWithoutPrompt && !initialMessage && messages.length === 0) {
+			// Startup sends go first: one can replay the calls and continue the session itself.
+			while (!session.parked && !requestedModel) {
+				if (session.hasExtensionDeliveries) {
+					await session.waitForExtensionDeliveries();
+				} else if (session.agent.hasPendingToolCalls()) {
+					// The replay's settlement can admit sends of its own, so check again before continuing.
+					await session.replayPendingToolCalls();
+					canResumeFromToolResult = true;
+				} else {
+					await session.resumeWithoutPrompt(canResumeFromToolResult);
+					break;
+				}
+			}
+		} else {
+			const prompts = initialMessage ? [initialMessage, ...messages] : messages;
+			for (const [index, message] of prompts.entries()) {
+				if (options.resumeWithoutPrompt) {
+					// A startup send's run must finish before a prompt can start.
+					while (session.hasExtensionDeliveries) await session.waitForExtensionDeliveries();
+				}
+				if (session.parked) break;
+				if (initialMessage && index === 0) await session.prompt(message, { images: initialImages });
+				else await session.prompt(message);
+			}
 		}
 
-		for (const message of messages) {
-			await session.prompt(message);
+		// A parked call hands control back to the caller: there is no final answer to print.
+		if (session.parked) {
+			await session.waitForIdle();
+			return 0;
 		}
 
 		if (mode === "text") {
@@ -167,7 +203,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		return exitCode;
 	} catch (error: unknown) {
-		console.error(error instanceof Error ? error.message : String(error));
+		const message = error instanceof Error ? error.message : String(error);
+		if (mode === "json") writeRawStdout(`${JSON.stringify({ type: "error", message })}\n`);
+		else console.error(message);
 		return 1;
 	} finally {
 		// Keep the signal handlers until disposal is done: without one, a signal would kill the

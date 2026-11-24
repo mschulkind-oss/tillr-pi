@@ -417,6 +417,10 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	/** A tool parked its call in the latest run. Reset when the next run starts. */
+	private _parked = false;
+	/** Extension sends (`pi.sendMessage`, `pi.sendUserMessage`) still delivering, through their runs. */
+	private readonly _extensionDeliveries = new Set<Promise<void>>();
 	private _promptPreflightCount = 0;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
@@ -1208,8 +1212,11 @@ export class AgentSession {
 			}
 		}
 
-		// Emit to extensions first, then notify public listeners.
-		await this._emitExtensionEvent(event);
+		if (event.type === "parked") this._parked = true;
+
+		// Emit to extensions first, then notify public listeners. A parked run did not end its
+		// turn, so extensions do not see it end.
+		if (!(this._parked && event.type === "agent_end")) await this._emitExtensionEvent(event);
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		// Handle session persistence
@@ -1956,8 +1963,15 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		// A call left unanswered gets its result before anything new enters the transcript.
+		if (await this._replayPendingToolCalls()) {
+			// It parked again. Keep a custom message rather than lose it; a prompt is dropped.
+			if (trigger.messageType === "custom") this._appendCustomMessage(trigger.message);
+			return;
+		}
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
+		this._parked = false;
 		let messages: AgentMessage[];
 		try {
 			messages = await this._prepareRun(trigger);
@@ -1982,24 +1996,118 @@ export class AgentSession {
 		this._pendingToolNames.clear();
 		try {
 			await this.agent.prompt(messages);
-			while (!this._agentRunAbortRequested) {
-				if (await this._handlePostAgentRun()) {
-					if (this._agentRunAbortRequested) break;
-					await this.agent.continue();
-					continue;
-				}
-				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+			await this._continueUntilSettled();
+		} finally {
+			await this._finishRun();
+		}
+	}
+
+	/** Continue the active run through retries, compaction, queues and agent_before_settle. */
+	private async _continueUntilSettled(): Promise<void> {
+		// A parked run stops where it is: no retry, no compaction, no settle boundary.
+		while (!this._agentRunAbortRequested && !this._parked) {
+			if (await this._handlePostAgentRun()) {
 				if (this._agentRunAbortRequested) break;
 				await this.agent.continue();
+				continue;
 			}
-		} finally {
-			if (this._agentRunAbortRequested) this._finishCancelledRetry();
-			this._failedResponse = undefined;
-			this._runSystemPromptOptions = undefined;
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+			if (this._agentRunAbortRequested) break;
+			await this.agent.continue();
 		}
+	}
+
+	/** End the active run: settle it, or for a parked run only become idle. */
+	private async _finishRun(): Promise<void> {
+		if (this._agentRunAbortRequested) this._finishCancelledRetry();
+		this._failedResponse = undefined;
+		this._runSystemPromptOptions = undefined;
+		if (this._parked) {
+			// The caller owns what happens next, so the run does not settle.
+			this._lastAssistantMessage = undefined;
+			this._isAgentRunActive = false;
+			this._resolveIdleWaitIfIdle();
+			return;
+		}
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages();
+		await this._emitAgentSettled();
+	}
+
+	/**
+	 * Run the transcript's unanswered tool calls (such as parked ones) again with their original ids
+	 * and arguments, as a run of their own that makes no model request. The run settles unless a
+	 * call parks again.
+	 * @returns Whether a call parked again.
+	 */
+	private async _replayPendingToolCalls(): Promise<boolean> {
+		if (this.isStreaming || !this.agent.hasPendingToolCalls()) return false;
+		this._isAgentRunActive = true;
+		this._agentRunAbortRequested = false;
+		this._parked = false;
+		try {
+			await this.agent.completePendingToolCalls();
+		} finally {
+			await this._finishRun();
+		}
+		return this._parked;
+	}
+
+	/** Whether a tool parked its call in the latest run, leaving it unanswered. */
+	get parked(): boolean {
+		return this._parked;
+	}
+
+	/**
+	 * Run unanswered tool calls again without a model request. Their results are saved, and the
+	 * replay settles unless a call parks again.
+	 */
+	async replayPendingToolCalls(): Promise<void> {
+		await this._replayPendingToolCalls();
+	}
+
+	/**
+	 * Continue a saved session without adding a user message: run its unanswered tool calls again
+	 * and continue to the model with their results, or continue from a saved trailing tool result.
+	 * Returns without a model request if a call parks again.
+	 * @param savedTrailingResult Whether the saved transcript ends in a tool result. Default: whether
+	 * the current one does. Pass the value read before startup hooks could append to it.
+	 * @throws Error if there is neither an unanswered call nor a trailing tool result.
+	 */
+	async resumeWithoutPrompt(
+		savedTrailingResult = this.agent.state.messages.at(-1)?.role === "toolResult",
+	): Promise<void> {
+		const pending = this.agent.hasPendingToolCalls();
+		if (pending && (await this._replayPendingToolCalls())) return;
+		if (!pending && !savedTrailingResult) {
+			throw new Error("No unanswered tool call or trailing tool result to continue");
+		}
+		this._isAgentRunActive = true;
+		this._agentRunAbortRequested = false;
+		this._parked = false;
+		this._failedResponse = undefined;
+		this._recordSelection();
+		try {
+			await this.agent.continue();
+			await this._continueUntilSettled();
+		} finally {
+			await this._finishRun();
+		}
+	}
+
+	/** Whether an extension send is still delivering its message, including the run it started. */
+	get hasExtensionDeliveries(): boolean {
+		return this._extensionDeliveries.size > 0;
+	}
+
+	/** Wait for the extension sends admitted so far. Callers recheck for sends admitted meanwhile. */
+	async waitForExtensionDeliveries(): Promise<void> {
+		await Promise.all(this._extensionDeliveries);
+	}
+
+	private _trackExtensionDelivery(delivery: Promise<void>): void {
+		this._extensionDeliveries.add(delivery);
+		void delivery.finally(() => this._extensionDeliveries.delete(delivery));
 	}
 
 	/**
@@ -2196,6 +2304,13 @@ export class AgentSession {
 			throw new Error(
 				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
 			);
+		}
+
+		// Input hooks may change active tools, so an unanswered call gets its result before them.
+		// If it parks again, the prompt is not sent.
+		if (await this._replayPendingToolCalls()) {
+			preflightResult?.("handled");
+			return;
 		}
 
 		// Reserve the context through async input hooks and auth checks so tree navigation cannot
@@ -3557,22 +3672,26 @@ export class AgentSession {
 		runner.bindCore(
 			{
 				sendMessage: (message, options) => {
-					this.sendCustomMessage(message, options).catch((err) => {
-						runner.emitError({
-							extensionPath: "<runtime>",
-							event: "send_message",
-							error: err instanceof Error ? err.message : String(err),
-						});
-					});
+					this._trackExtensionDelivery(
+						this.sendCustomMessage(message, options).catch((err) => {
+							runner.emitError({
+								extensionPath: "<runtime>",
+								event: "send_message",
+								error: err instanceof Error ? err.message : String(err),
+							});
+						}),
+					);
 				},
 				sendUserMessage: (content, options) => {
-					this.sendUserMessage(content, options).catch((err) => {
-						runner.emitError({
-							extensionPath: "<runtime>",
-							event: "send_user_message",
-							error: err instanceof Error ? err.message : String(err),
-						});
-					});
+					this._trackExtensionDelivery(
+						this.sendUserMessage(content, options).catch((err) => {
+							runner.emitError({
+								extensionPath: "<runtime>",
+								event: "send_user_message",
+								error: err instanceof Error ? err.message : String(err),
+							});
+						}),
+					);
 				},
 				appendEntry: (customType, data) => {
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
