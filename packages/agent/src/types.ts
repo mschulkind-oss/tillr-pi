@@ -443,6 +443,13 @@ export interface AgentToolResult<T = JsonValue | undefined> {
 	 * Early termination only happens when every finalized tool result in the batch sets this to true.
 	 */
 	terminate?: boolean;
+	/**
+	 * Leave this call unanswered and end the run: no result is recorded, `afterToolCall` does not
+	 * run, other calls in the batch still finish, and no further model request is made. A later
+	 * {@link Agent.completePendingToolCalls} invokes the same call again with its original id and
+	 * arguments.
+	 */
+	park?: boolean;
 }
 
 /** Final outcome of a tool call after hooks ran. */
@@ -539,6 +546,8 @@ export type AgentEvent =
 	| { type: "message_end"; message: AgentMessage }
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
+	// A tool parked its call: it has no tool_execution_end and no result message.
+	| { type: "parked"; toolCallId: string; toolName: string }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
 	| {
 			type: "tool_execution_end";

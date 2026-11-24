@@ -510,6 +510,8 @@ Thrown errors are caught by the agent and reported to the LLM as tool errors wit
 
 Return `terminate: true` from `execute()`, a blocked `beforeToolCall`, or `afterToolCall` to hint that the agent should stop after the current tool batch. This only takes effect when every finalized tool result in the batch is terminating. The hint is runtime-only; emitted `toolResult` transcript messages remain standard LLM tool results.
 
+Return `park: true` from `execute()` to leave the call unanswered. The loop emits `{ type: "parked", toolCallId, toolName }` instead of `tool_execution_end`, records no result for that call, skips `afterToolCall` for it, lets the rest of the batch finish, and ends the run with `agent_end` and no further model request. `agent.hasPendingToolCalls()` then reports the unanswered call, and `agent.completePendingToolCalls()` runs it again with its original id and arguments, without a model request. A call that parks again stays unanswered.
+
 ### MCP and Codemode
 
 `@earendil-works/pi-mcp` connects to MCP servers and `@earendil-works/pi-codemode` runs model-written JavaScript that calls tools. [examples/mcp-codemode](examples/mcp-codemode) wraps both as `AgentTool`s: one tool per MCP tool, and a `codemode` tool whose scripts call the agent's tools through `runToolCall()`, so `beforeToolCall` and `afterToolCall` apply to those calls too.

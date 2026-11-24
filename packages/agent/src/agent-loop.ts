@@ -159,6 +159,58 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+/** Find the calls in the transcript's last assistant batch that have no result yet. */
+export function getPendingToolCalls(
+	messages: AgentMessage[],
+): { assistant: AssistantMessage; toolCalls: AgentToolCall[] } | undefined {
+	const assistantIndex = messages.findLastIndex((message) => message.role === "assistant");
+	const assistant = messages[assistantIndex];
+	if (assistant?.role !== "assistant" || assistant.stopReason !== "toolUse") return undefined;
+	const answered = new Set(
+		messages
+			.slice(assistantIndex + 1)
+			.filter((message) => message.role === "toolResult")
+			.map((message) => message.toolCallId),
+	);
+	const toolCalls = assistant.content.filter(
+		(part): part is AgentToolCall => part.type === "toolCall" && !answered.has(part.id),
+	);
+	return toolCalls.length > 0 ? { assistant, toolCalls } : undefined;
+}
+
+/**
+ * Run the transcript's unanswered tool calls (for example parked ones) with their original ids
+ * and arguments, and record their results. Makes no model request. A call that parks again stays
+ * unanswered.
+ */
+export async function runAgentPendingToolCalls(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+): Promise<AgentMessage[]> {
+	const newMessages: AgentMessage[] = [];
+	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
+	await emit({ type: "agent_start" });
+	await emit({ type: "turn_start" });
+	const pending = getPendingToolCalls(currentContext.messages);
+	if (pending) {
+		const { assistant, toolCalls } = pending;
+		const batch = await executeToolCalls(currentContext, { ...assistant, content: toolCalls }, config, signal, emit);
+		currentContext.messages.push(...batch.messages);
+		newMessages.push(...batch.messages);
+		if (!batch.parked) {
+			await config.finishTurn?.(
+				{ message: assistant, toolResults: batch.messages, context: currentContext, newMessages },
+				signal,
+			);
+			await emit({ type: "turn_end", message: assistant, toolResults: batch.messages });
+		}
+	}
+	await emit({ type: "agent_end", messages: newMessages });
+	return newMessages;
+}
+
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	return new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
@@ -284,6 +336,11 @@ async function runLoop(
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
+				// A parked call stays unanswered, so the turn is not complete: end without its hooks.
+				if (executedToolBatch.parked) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
 			}
 
 			lastCompletedTurn = {
@@ -384,6 +441,29 @@ function withToolChanges(message: SystemMessage, { toolsAdded, toolsRemoved }: T
 }
 
 /**
+ * Move each assistant's tool results directly after it. A message can be appended while a call is
+ * parked (for example by a startup hook) and land before the call's result, and providers require
+ * the results of an assistant's calls to follow it immediately.
+ */
+function orderToolResults(messages: AgentMessage[]): AgentMessage[] {
+	const ordered: AgentMessage[] = [];
+	for (let index = 0; index < messages.length; index++) {
+		const message = messages[index];
+		ordered.push(message);
+		if (message.role !== "assistant") continue;
+		const ids = new Set(message.content.filter((part) => part.type === "toolCall").map((part) => part.id));
+		if (ids.size === 0) continue;
+		let end = index + 1;
+		while (end < messages.length && messages[end].role !== "assistant") end++;
+		const following = messages.slice(index + 1, end);
+		const isResult = (item: AgentMessage) => item.role === "toolResult" && ids.has(item.toolCallId);
+		ordered.push(...following.filter(isResult), ...following.filter((item) => !isResult(item)));
+		index = end - 1;
+	}
+	return ordered;
+}
+
+/**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
  */
@@ -401,7 +481,7 @@ async function streamAssistantResponse(
 	}
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
+	const llmMessages = await config.convertToLlm(orderToolResults(messages));
 
 	const llmContext = normalizeContext({ messages: llmMessages });
 
@@ -509,7 +589,7 @@ async function failToolCallsFromTruncatedMessage(
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
-	return { messages, terminate: false };
+	return { messages, terminate: false, parked: false };
 }
 
 /**
@@ -535,7 +615,17 @@ async function executeToolCalls(
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	/** At least one call parked and has no result message. */
+	parked: boolean;
 };
+
+function isParked(finalized: FinalizedToolCallOutcome): boolean {
+	return finalized.result.park === true;
+}
+
+async function emitParked(toolCall: AgentToolCall, emit: AgentEventSink): Promise<void> {
+	await emit({ type: "parked", toolCallId: toolCall.id, toolName: toolCall.name });
+}
 
 async function executeToolCallsSequential(
 	currentContext: AgentContext,
@@ -576,16 +666,21 @@ async function executeToolCallsSequential(
 			);
 		}
 
+		finalizedCalls.push(finalized);
+		if (isParked(finalized)) {
+			await emitParked(toolCall, emit);
+			continue;
+		}
 		await emitToolExecutionEnd(finalized, emit);
 		const toolResultMessage = createToolResultMessage(finalized);
 		await emitToolResultMessage(toolResultMessage, emit);
-		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 	}
 
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		parked: finalizedCalls.some(isParked),
 	};
 }
 
@@ -638,7 +733,8 @@ async function executeToolCallsParallel(
 				config,
 				signal,
 			);
-			await emitToolExecutionEnd(finalized, emit);
+			if (isParked(finalized)) await emitParked(toolCall, emit);
+			else await emitToolExecutionEnd(finalized, emit);
 			return finalized;
 		});
 	}
@@ -648,6 +744,7 @@ async function executeToolCallsParallel(
 	);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
+		if (isParked(finalized)) continue;
 		const toolResultMessage = createToolResultMessage(finalized);
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
@@ -656,6 +753,7 @@ async function executeToolCallsParallel(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		parked: orderedFinalizedCalls.some(isParked),
 	};
 }
 
@@ -869,6 +967,9 @@ async function finalizeExecutedToolCall(
 ): Promise<FinalizedToolCallOutcome> {
 	let result = executed.result;
 	let isError = executed.isError;
+
+	// A parked call has no result yet, so there is nothing for afterToolCall to inspect.
+	if (result.park === true) return { toolCall: prepared.toolCall, result, isError, durationMs: executed.durationMs };
 
 	if (config.afterToolCall) {
 		try {

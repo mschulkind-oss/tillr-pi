@@ -12,7 +12,7 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { getPendingToolCalls, runAgentLoop, runAgentLoopContinue, runAgentPendingToolCalls } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -419,6 +419,29 @@ export class Agent {
 		await this.runContinuation();
 	}
 
+	/** Whether the transcript's last assistant batch has calls without results, such as parked ones. */
+	hasPendingToolCalls(): boolean {
+		return getPendingToolCalls(this._state.messages) !== undefined;
+	}
+
+	/**
+	 * Run the transcript's unanswered tool calls again with their original ids and arguments and
+	 * record their results, without a model request. A call that parks again stays unanswered.
+	 */
+	async completePendingToolCalls(): Promise<void> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before completing tool calls.");
+		}
+		await this.runWithLifecycle(async (signal) => {
+			await runAgentPendingToolCalls(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+			);
+		});
+	}
+
 	private normalizePromptInput(
 		input: string | AgentMessage | AgentMessage[],
 		images?: ImageContent[],
@@ -594,6 +617,7 @@ export class Agent {
 				break;
 			}
 
+			case "parked":
 			case "tool_execution_end": {
 				const pendingToolCalls = new Set(this._state.pendingToolCalls);
 				pendingToolCalls.delete(event.toolCallId);
