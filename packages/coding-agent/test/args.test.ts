@@ -21,6 +21,15 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--features flag", () => {
+		test("parses --features without treating it as a message", () => {
+			const result = parseArgs(["--features"]);
+			expect(result.features).toBe(true);
+			expect(result.messages).toEqual([]);
+			expect(result.diagnostics).toEqual([]);
+		});
+	});
+
 	describe("--help flag", () => {
 		test("parses --help flag", () => {
 			const result = parseArgs(["--help"]);

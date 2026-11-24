@@ -69,6 +69,14 @@ A message an extension sends while the session starts is delivered first. If tha
 
 Opening the session with a prompt also runs the unanswered calls first. If one parks again, the prompt is not sent.
 
+An integration can check for support before relying on this behavior:
+
+```bash
+pi --features
+```
+
+The output is a JSON array of feature names. `parked-tool-calls` identifies the park and promptless-resume behavior described here. A build that does not recognize the flag does not support it.
+
 ## Control Pi with RPC
 
 RPC mode keeps Pi running while another process sends commands and receives responses and events:

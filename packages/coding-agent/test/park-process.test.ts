@@ -148,4 +148,11 @@ describe("parked calls in print processes", () => {
 		},
 		60_000,
 	);
+
+	it("prints feature names without starting a session", async () => {
+		const { dir } = setup();
+		const result = await run(dir, ["--features"]);
+		expect(result.code, result.stderr).toBe(0);
+		expect(JSON.parse(result.stdout)).toContain("parked-tool-calls");
+	}, 30_000);
 });

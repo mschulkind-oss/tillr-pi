@@ -246,6 +246,8 @@ See [Configuration](configuration.md) for saved configuration, [Security](securi
   Shows help, including flags registered by loaded extensions, then exits.
 - `-v`, `--version`<br>
   Shows the Pi version, then exits.
+- `--features`<br>
+  Prints the names of supported features beyond upstream Pi as a JSON array, then exits. See [Park a tool call](cli-integration.md#park-a-tool-call-and-resume-without-a-prompt).
 
 Extensions may register additional long-form options. Unknown short options are rejected.
 

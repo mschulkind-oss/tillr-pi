@@ -674,6 +674,12 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("parseArgs");
 
+	// Feature names an integration can check before relying on behavior beyond upstream pi.
+	if (parsed.features) {
+		console.log(JSON.stringify(["parked-tool-calls"]));
+		return;
+	}
+
 	if (parsed.version) {
 		console.log(VERSION);
 		process.exit(0);

@@ -21,6 +21,7 @@ export interface Args {
 	resume?: boolean;
 	help?: boolean;
 	version?: boolean;
+	features?: boolean;
 	mode?: Mode;
 	name?: string;
 	noSession?: boolean;
@@ -93,6 +94,8 @@ export function parseArgs(args: string[]): Args {
 			result.help = true;
 		} else if (arg === "--version" || arg === "-v") {
 			result.version = true;
+		} else if (arg === "--features") {
+			result.features = true;
 		} else if (arg === "--mode") {
 			const mode = args[i + 1];
 			if (mode === undefined || mode.startsWith("-")) {
@@ -343,6 +346,7 @@ ${chalk.bold("Options:")}
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --                             End option parsing; treat remaining arguments as messages/files
   --help, -h                     Show this help
+  --features                     Print supported feature names as a JSON array
   --version, -v                  Show version number
 
 Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
