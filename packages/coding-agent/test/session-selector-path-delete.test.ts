@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SessionInfo } from "../src/core/session-manager.ts";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
@@ -387,12 +387,12 @@ describe("session selector path/delete interactions", () => {
 		list.handleInput("\x1b[A");
 		expect(list.getSelectedSessionPath()).toBe(sessions[0]!.path);
 
+		const deleteSession = vi.spyOn(list, "onDeleteSession");
 		list.handleInput(CTRL_D);
 		list.handleInput("\r");
-		for (let i = 0; i < 10 && existsSync(sessions[0]!.path); i++) {
-			await new Promise((resolve) => setTimeout(resolve, 10));
-		}
-		await flushPromises();
+		expect(deleteSession).toHaveBeenCalledExactlyOnceWith(sessions[0]!.path);
+		// The file can be gone before the selector has finished reloading the list.
+		await deleteSession.mock.results[0]?.value;
 
 		expect(existsSync(sessions[0]!.path)).toBe(false);
 		expect(list.getSelectedSessionPath()).toBe(sessions[1]!.path);
