@@ -30,7 +30,8 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Build
-        run: npm run build
+        # Fork: build from the pinned model catalog, not live provider data.
+        run: bash scripts/build-from-pinned-catalog.sh
 
       # Previews are published for main, release tags and PRs from branches of this repo only (see preview-packages.yml).
       - name: Pack preview packages
@@ -55,8 +56,10 @@ jobs:
       # The checkout has no tags; the released changelog sections are compared with the newest release tag.
       - name: Fetch the newest release tag
         run: |
-          tag=$(git ls-remote --tags --sort=-v:refname origin 'v*.*.*' | grep -v '\^{}' | head -1 | sed 's#.*refs/tags/##')
-          git fetch --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          # Fork: release tags live upstream; this repository carries none.
+          upstream=https://github.com/earendil-works/pi.git
+          tag=$(git ls-remote --tags --sort=-v:refname "$upstream" 'v*.*.*' | grep -v '\^{}' | head -1 | sed 's#.*refs/tags/##')
+          git fetch --depth=1 "$upstream" "refs/tags/$tag:refs/tags/$tag"
 
       - name: Check released changelog sections
         run: npm run check:released-changelogs
@@ -95,7 +98,8 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Build
-        run: npm run build
+        # Fork: build from the pinned model catalog, not live provider data.
+        run: bash scripts/build-from-pinned-catalog.sh
 
       - name: Build the pi-env daemon
         if: matrix.name == 'other'
